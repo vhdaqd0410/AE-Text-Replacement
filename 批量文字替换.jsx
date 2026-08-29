@@ -53,6 +53,142 @@ function BT_UpdateProgress(done, total, msg) {
     } catch (e) {}
 }
 
+// ============================================================
+//  对称对齐配置（称号/人名以参考图层为中心左右对称排列）
+// ============================================================
+var BT_AlignEnabled = false;      // 是否启用自动对称对齐（默认关闭：只替换文字，不动位置）
+var BT_RefLayerName = "op光";     // 参考图层名（屏幕正中央的那个图层）
+var BT_LeftVarName = "称号";      // 放在参考图层左侧的变量名
+var BT_RightVarName = "中文名";   // 放在参考图层右侧的变量名（人名）
+var BT_Gap = 20;                  // 称号/人名与参考图层中心之间的水平间距（像素）
+var BT_LeftOffset = 0;            // 称号的额外水平偏移（正值向右，负值向左）
+var BT_RightOffset = 0;           // 人名的额外水平偏移（正值向右，负值向左）
+var BT_DebugAlign = false;        // 是否在对齐时弹出诊断信息（定位问题用）
+
+// 在指定合成中按名字查找图层（大小写不敏感、去除首尾空格）
+function BT_FindLayerByName(comp, name) {
+    if (!comp) return null;
+    var target = (name || "").replace(/^\s+|\s+$/g, "").toLowerCase();
+    if (!target) return null;
+    for (var i = 1; i <= comp.numLayers; i++) {
+        var l = comp.layers[i];
+        try {
+            var ln = (l.name || "").replace(/^\s+|\s+$/g, "").toLowerCase();
+            if (ln === target) return l;
+        } catch (e) {}
+    }
+    return null;
+}
+
+// 核心对齐：以参考图层（如 op光）为对称中心，把"左侧变量"的文字右边缘、以及"右侧变量"的
+// 文字左边缘，分别摆到距中心 gap 的位置；同时两者垂直中心都对齐到参考图层的垂直中心。
+// 只调整 position，不改锚点，因此不会造成锚点相关的跑偏。
+// 参数：
+//   resolvedLayers  { key -> 图层对象 }（已在 BT_ProcessRows 解析好）
+//   comp            当前模板合成
+// 返回 { ok: bool, msg: string }
+function BT_AlignToReference(resolvedLayers, comp) {
+    if (!BT_AlignEnabled) return { ok: true, msg: "对齐已关闭" };
+    if (!comp) return { ok: false, msg: "无有效合成" };
+
+    // 1. 找参考图层（op光）
+    var refLayer = BT_FindLayerByName(comp, BT_RefLayerName);
+    if (!refLayer) return { ok: false, msg: "未找到参考图层 \"" + BT_RefLayerName + "\"" };
+
+    // 参考图层的合成坐标（中心）
+    var refPos = null;
+    try {
+        var posProp = refLayer.property("ADBE Transform Group").property("ADBE Position");
+        if (posProp) refPos = posProp.value;
+        else if (refLayer.position !== undefined) refPos = refLayer.position.value;
+    } catch (e) {}
+    if (!refPos) return { ok: false, msg: "无法读取参考图层 \"" + BT_RefLayerName + "\" 的位置" };
+    var refX = refPos[0];
+    var refY = refPos[1];
+
+    // 2. 找到左侧、右侧变量对应的图层
+    var leftLayer = null, rightLayer = null;
+    for (var k in BT_MappingConfig) {
+        var vn = BT_MappingConfig[k];
+        var l = resolvedLayers[k];
+        if (!l) continue;
+        if (vn === BT_LeftVarName) leftLayer = l;
+        else if (vn === BT_RightVarName) rightLayer = l;
+    }
+
+    var gap = (typeof BT_Gap === "number") ? BT_Gap : 20;
+    var leftOff = (typeof BT_LeftOffset === "number") ? BT_LeftOffset : 0;
+    var rightOff = (typeof BT_RightOffset === "number") ? BT_RightOffset : 0;
+    var msgs = [];
+
+    // 3. 左侧变量：文字水平中心对齐到 refX - gap（再叠加左侧额外偏移）
+    if (leftLayer) {
+        var r1 = BT_AlignLayerCenter(leftLayer, refX - gap + leftOff, refY, comp);
+        msgs.push("称号(" + leftLayer.name + "): " + r1.msg);
+    } else {
+        msgs.push("未找到左侧变量 \"" + BT_LeftVarName + "\" 对应的图层");
+    }
+
+    // 4. 右侧变量：文字水平中心对齐到 refX + gap（再叠加右侧额外偏移）
+    if (rightLayer) {
+        var r2 = BT_AlignLayerCenter(rightLayer, refX + gap + rightOff, refY, comp);
+        msgs.push("人名(" + rightLayer.name + "): " + r2.msg);
+    } else {
+        msgs.push("未找到右侧变量 \"" + BT_RightVarName + "\" 对应的图层");
+    }
+
+    // 诊断信息头部：参考图层位置
+    var head = "参考[" + BT_RefLayerName + "] pos=(" + Math.round(refX) + "," + Math.round(refY) + ") 错开=" + gap + " 左偏=" + leftOff + " 右偏=" + rightOff;
+    return { ok: true, msg: head + "\n" + msgs.join("\n") };
+}
+
+// 把文字层的水平中心和垂直中心都对齐到目标 (targetX, targetY)。
+// 用 sourceRectAtTime 计算文字的几何中心，再补偿锚点偏移，得到正确的 position。
+// 不改锚点（保持模板原有锚点/对齐方式）。
+// 返回 { ok, msg }
+function BT_AlignLayerCenter(layer, targetX, targetY, comp) {
+    try {
+        if (!layer) return { ok: false, msg: "图层为空" };
+
+        // 读取当前锚点（不动它）
+        var ax = 0, ay = 0;
+        try {
+            if (layer.anchorPoint !== undefined) {
+                var apv = layer.anchorPoint.value;
+                ax = apv[0]; ay = apv[1];
+            }
+        } catch (e) {}
+
+        var t = comp ? comp.time : 0;
+        var rect = layer.sourceRectAtTime(t, true);
+        if (!rect) return { ok: false, msg: "无法读取文字包围盒" };
+
+        // 文字的几何中心（相对图层原点）
+        var centerX = rect.left + rect.width / 2;
+        var centerY = rect.top + rect.height / 2;
+
+        // 文字中心相对锚点的偏移
+        var offX = centerX - ax;
+        var offY = centerY - ay;
+
+        // 目标 position：让文字中心落在 (targetX, targetY)
+        //   文字中心(合成坐标) = position + off  =>  position = target - off
+        var px = targetX - offX;
+        var py = targetY - offY;
+
+        var posProp = layer.property("ADBE Transform Group").property("ADBE Position");
+        if (posProp) posProp.setValue([px, py]);
+        else if (layer.position !== undefined) layer.position.setValue([px, py]);
+
+        if (BT_DebugAlign) {
+            return { ok: true, msg: layer.name + " | 锚点=(" + Math.round(ax) + "," + Math.round(ay) + ") 文字中心=(" + Math.round(centerX) + "," + Math.round(centerY) + ") → position=(" + Math.round(px) + "," + Math.round(py) + ")" };
+        }
+        return { ok: true, msg: "已居中(" + Math.round(targetX) + "," + Math.round(targetY) + ")" };
+    } catch (e) {
+        return { ok: false, msg: "对齐出错: " + e.message };
+    }
+}
+
 // 图层唯一标识：记录"合成项目索引 + 逐级图层索引路径"
 // 例如：主合成索引3，文字层在 [预合成A(层2) -> 文字层(层1)]，则 key = "3:2.1"
 // 文字层直接在合成中则 key = "3:5"（层索引5）。
@@ -106,6 +242,12 @@ function BT_ResolveLayer(key) {
     var rootIdx = parseInt(key.substring(0, idxSep));
     var pathStr = key.substring(idxSep + 1);
     if (isNaN(rootIdx) || rootIdx < 1) return null;
+    // 越界保护：rootIdx 超出当前项目 item 范围时直接判定为失效（避免 app.project.item 抛异常）
+    try {
+        if (rootIdx > app.project.numItems) return null;
+    } catch (e) {
+        return null;
+    }
     var comp = app.project.item(rootIdx);
     if (!comp || !(comp instanceof CompItem)) return null;
     var parts = pathStr.split(".");
@@ -756,6 +898,29 @@ function BT_LoadMappingFromFile() {
     return false;
 }
 
+// 清理失效的映射：换模板/换项目后，旧映射的图层 key（形如 "131:2.2.6.1.1.1"）无法再
+// 解析到当前项目中的文字层。此函数自动检测并删除这些失效 key，返回被清理的数量。
+function BT_PruneInvalidMappings() {
+    var removed = 0;
+    var badKeys = [];
+    for (var k in BT_MappingConfig) {
+        var l = null;
+        try {
+            l = BT_ResolveLayer(k);
+        } catch (e) {
+            l = null; // 解析抛异常也视为失效
+        }
+        if (!l) {
+            badKeys.push(k);
+        }
+    }
+    for (var i = 0; i < badKeys.length; i++) {
+        delete BT_MappingConfig[badKeys[i]];
+        removed++;
+    }
+    return removed;
+}
+
 // ============================================================
 //  数据驱动批量填充 + 渲染
 // ============================================================
@@ -765,6 +930,17 @@ function BT_BatchFill(ui) {
         alert("请先配置变量映射（点击“变量映射”按钮）");
         return;
     }
+
+    // 自动清理失效映射：换了模板/项目后，旧映射的图层 key 无法解析，先剔除，避免静默失败
+    var pruned = BT_PruneInvalidMappings();
+    if (pruned > 0) {
+        alert("检测到 " + pruned + " 条映射已失效（可能是更换了模板或项目文件）。\n已自动清除这些旧映射。\n\n请点【变量映射配置】为新模板重新指定变量名，再重新批量填充。");
+    }
+    if (BT_CountMapping() === 0) {
+        alert("当前没有可用的变量映射（旧映射已失效）。\n请先点【变量映射配置】，为新模板的文字层指定变量名。");
+        return;
+    }
+
     // 选择 CSV
     var csvFile = File.openDialog("请选择 CSV 数据文件", "CSV 文件:*.csv;*.txt;所有文件:*.*");
     if (!csvFile) return;
@@ -847,7 +1023,12 @@ function BT_BatchFill(ui) {
     }
     var diagBad = [];
     for (var dk in BT_MappingConfig) {
-        var dl = BT_ResolveLayer(dk);
+        var dl = null;
+        try {
+            dl = BT_ResolveLayer(dk);
+        } catch (e) {
+            dl = null;
+        }
         if (!dl) {
             diagBad.push(BT_MappingConfig[dk] + " (key=" + dk + ")");
         }
@@ -861,14 +1042,24 @@ function BT_BatchFill(ui) {
     BT_ProcessRows(rows, header, mapToCol, nameColChoice, outDir.fsName);
 }
 
-// 恢复图层到原始文字
-// originals: key -> {layer: 图层对象, text: 原始文本} 的结构（优化：用缓存图层，避免重复解析）
+// 恢复图层到原始文字（以及原始 position，若已记录）
+// originals: key -> {layer: 图层对象, text: 原始文本, pos: 原始位置数组（可选）}
 function BT_RestoreLayers(originals) {
     if (!originals) return;
     for (var rk in originals) {
         var rec = originals[rk];
-        if (rec && rec.layer && rec.text !== null) {
-            BT_SetSourceText(rec.layer, rec.text);
+        if (rec && rec.layer) {
+            if (rec.text !== null) {
+                BT_SetSourceText(rec.layer, rec.text);
+            }
+            // 恢复原始 position（对齐功能会改 position，逐行渲染需还原）
+            if (rec.pos) {
+                try {
+                    var pp = rec.layer.property("ADBE Transform Group").property("ADBE Position");
+                    if (pp) pp.setValue(rec.pos);
+                    else if (rec.layer.position !== undefined) rec.layer.position.setValue(rec.pos);
+                } catch (e) {}
+            }
         }
     }
 }
@@ -930,11 +1121,19 @@ function BT_ProcessRows(rows, header, mapToCol, nameColIdx, outDir) {
 
         // 0. 解析所有映射图层并记录原始文字（缓存图层对象，填充/验证/恢复复用，避免重复解析）
         var resolvedLayers = {}; // key -> 图层对象
-        var originals = {};      // key -> {layer, text}
+        var originals = {};      // key -> {layer, text, pos}
         for (var omk in BT_MappingConfig) {
             var ol = BT_ResolveLayer(omk);
             resolvedLayers[omk] = ol;
-            originals[omk] = { layer: ol, text: ol ? BT_GetSourceText(ol) : null };
+            var opos = null;
+            if (ol) {
+                try {
+                    var opp = ol.property("ADBE Transform Group").property("ADBE Position");
+                    if (opp) opos = opp.value;
+                    else if (ol.position !== undefined) opos = ol.position.value;
+                } catch (e) {}
+            }
+            originals[omk] = { layer: ol, text: ol ? BT_GetSourceText(ol) : null, pos: opos };
         }
 
         // 1. 在原始模板合成中填充
@@ -958,6 +1157,15 @@ function BT_ProcessRows(rows, header, mapToCol, nameColIdx, outDir) {
             allOk = false;
             BT_RestoreLayers(originals);
             continue;
+        }
+
+        // 1.5 对称对齐：以参考图层（op光）为中心，把称号/人名左右对称摆放
+        var alignResult = BT_AlignToReference(resolvedLayers, templateComp);
+        if (BT_DebugAlign) {
+            alert("【对齐诊断】第 " + (r+1) + " 行\n" + alignResult.msg);
+        } else if (!alignResult.ok) {
+            // 对齐失败不中断渲染，仅提示（记录到进度状态）
+            BT_UpdateProgress(successCount, rows.length, "第 " + (r+1) + " 行 对齐提示：" + alignResult.msg);
         }
 
         // 2. 验证填充是否正确
@@ -1089,7 +1297,7 @@ function BT_SanitizeFilename(name) {
 // ============================================================
 function BT_CreateUI() {
     var isPanelMode = (this instanceof Panel);
-    var container = isPanelMode ? this : new Window("palette", "批量文字替换工具", [0, 0, 560, 668], {resizeable: true});
+    var container = isPanelMode ? this : new Window("palette", "批量文字替换工具", [0, 0, 560, 736], {resizeable: true});
 
     // ===== 顶部标题 =====
     var title = container.add("statictext", [8, 6, 280, 28], "批量文字替换工具");
@@ -1132,26 +1340,55 @@ function BT_CreateUI() {
     var batchInfo = container.add("statictext", [170, 494, 545, 516], "选CSV→确认→自动逐行渲染，文件名取中文名列", {multiline:true});
     batchInfo.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
 
+    // ===== 对称对齐设置（称号/人名以参考图层 op光 为中心左右对称） =====
+    var alignChk = container.add("checkbox", [8, 524, 180, 546], "对称对齐（以op光为中心）");
+    alignChk.value = BT_AlignEnabled;
+    alignChk.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    alignChk.onClick = function() { BT_AlignEnabled = alignChk.value; };
+
+    container.add("statictext", [188, 526, 300, 546], "参考图层名：", {multiline:false}).graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    var refNameEdit = container.add("edittext", [300, 524, 400, 546], BT_RefLayerName);
+    refNameEdit.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    refNameEdit.onChange = function() { BT_RefLayerName = refNameEdit.text; };
+
+    container.add("statictext", [408, 526, 470, 546], "错开：", {multiline:false}).graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    var gapEdit = container.add("edittext", [470, 524, 545, 546], String(BT_Gap));
+    gapEdit.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    gapEdit.onChange = function() { var g = parseInt(gapEdit.text); if (!isNaN(g)) BT_Gap = g; };
+
+    // 第二行：称号/人名的独立水平偏移微调
+    container.add("statictext", [8, 552, 90, 572], "称号偏移：", {multiline:false}).graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    var leftOffEdit = container.add("edittext", [90, 550, 180, 572], String(BT_LeftOffset));
+    leftOffEdit.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    leftOffEdit.onChange = function() { var v = parseInt(leftOffEdit.text); if (!isNaN(v)) BT_LeftOffset = v; };
+
+    container.add("statictext", [190, 552, 270, 572], "人名偏移：", {multiline:false}).graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    var rightOffEdit = container.add("edittext", [270, 550, 360, 572], String(BT_RightOffset));
+    rightOffEdit.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
+    rightOffEdit.onChange = function() { var v = parseInt(rightOffEdit.text); if (!isNaN(v)) BT_RightOffset = v; };
+
+    container.add("statictext", [370, 552, 545, 572], "偏移：正值向右、负值向左", {multiline:false}).graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 10);
+
     // ===== 批量处理进度 =====
-    var secProg = container.add("statictext", [8, 526, 540, 544], "━━ 批量处理进度 ━━");
+    var secProg = container.add("statictext", [8, 580, 540, 598], "━━ 批量处理进度 ━━");
     secProg.graphics.font = ScriptUI.newFont("Microsoft YaHei", "bold", 12);
     try { secProg.graphics.foregroundColor = ScriptUI.newColor(0, 150, 90); } catch (e) {}
 
-    var progressBar = container.add("progressbar", [8, 548, 545, 568]);
+    var progressBar = container.add("progressbar", [8, 602, 545, 622]);
     progressBar.maxvalue = 1;
     progressBar.value = 0;
 
-    var progressText = container.add("statictext", [8, 572, 545, 592], "进度：0 / 0 行", {multiline:true});
+    var progressText = container.add("statictext", [8, 626, 545, 646], "进度：0 / 0 行", {multiline:true});
     progressText.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
 
-    var progressStatus = container.add("statictext", [8, 594, 545, 614], "尚未开始批量处理", {multiline:true});
+    var progressStatus = container.add("statictext", [8, 648, 545, 668], "尚未开始批量处理", {multiline:true});
     progressStatus.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
 
     // ===== 状态栏 + 帮助 =====
-    var statusText = container.add("statictext", [8, 618, 545, 640], "状态：未扫描", {multiline:true});
+    var statusText = container.add("statictext", [8, 672, 545, 694], "状态：未扫描", {multiline:true});
     statusText.graphics.font = ScriptUI.newFont("Microsoft YaHei", "regular", 11);
 
-    var helpBtn = container.add("button", [460, 642, 545, 664], "使用帮助");
+    var helpBtn = container.add("button", [460, 698, 545, 720], "使用帮助");
 
     // ---- 绑定事件 ----
     (function(ui) {
@@ -1231,7 +1468,17 @@ function BT_CreateUI() {
 
         // 启动时自动载入映射（无需每次手动设置）
         if (BT_LoadMappingFromFile()) {
-            ui.statusText.text = "状态：已自动载入 " + BT_CountMapping() + " 条映射（可点【变量映射配置】查看/修改）";
+            // 载入后自动清理失效映射（换模板/项目后旧 key 失效）
+            var prunedAtStart = BT_PruneInvalidMappings();
+            if (prunedAtStart > 0) {
+                if (BT_CountMapping() === 0) {
+                    ui.statusText.text = "状态：检测到旧模板映射已失效（已清除 " + prunedAtStart + " 条）。请点【变量映射配置】重新映射";
+                } else {
+                    ui.statusText.text = "状态：已载入 " + BT_CountMapping() + " 条映射，自动清除 " + prunedAtStart + " 条失效旧映射";
+                }
+            } else {
+                ui.statusText.text = "状态：已自动载入 " + BT_CountMapping() + " 条映射（可点【变量映射配置】查看/修改）";
+            }
         } else {
             alert("尚未配置变量映射。\n请点击【变量映射配置】，为模板中的文字层指定变量名（对应CSV表头）。");
         }
